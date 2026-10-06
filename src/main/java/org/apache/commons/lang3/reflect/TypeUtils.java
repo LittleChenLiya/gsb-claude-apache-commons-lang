@@ -23,12 +23,14 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -172,6 +174,233 @@ public class TypeUtils {
         @Override
         public String toString() {
             return TypeUtils.toString(this);
+        }
+    }
+
+    /**
+     * A single type-variable binding recorded in a {@link TypeBindingReport}. A binding states that a {@link TypeVariable} was observed to be associated
+     * with a {@link Type} while walking the real supertype hierarchy of the reported subject, and classifies how strong that association is.
+     *
+     * @since 3.21.1
+     */
+    public static final class TypeBinding {
+
+        /**
+         * Classification of a {@link TypeBinding}.
+         */
+        public enum Kind {
+            /** The variable is bound to a concrete argument, for example {@code String} in {@code List<String>}. */
+            EXACT,
+            /** The variable is bounded by a wildcard upper bound, for example {@code Number} in {@code ? extends Number}. */
+            UPPER_BOUND,
+            /** The variable is bounded by a wildcard lower bound, for example {@code Integer} in {@code ? super Integer}. */
+            LOWER_BOUND,
+            /** The variable is bound to an unbounded wildcard {@code ?}; the actual argument is unknown. */
+            UNKNOWN,
+            /** The variable could not be resolved; the binding keeps the unresolved {@link TypeVariable} symbol as its type. */
+            UNRESOLVED
+        }
+
+        private final TypeVariable<?> variable;
+        private final Type type;
+        private final Kind kind;
+
+        /**
+         * Constructs a new instance.
+         *
+         * @param variable the bound type variable.
+         * @param type     the associated type, {@code null} only for {@link Kind#UNKNOWN}.
+         * @param kind     the binding kind.
+         */
+        TypeBinding(final TypeVariable<?> variable, final Type type, final Kind kind) {
+            this.variable = variable;
+            this.type = type;
+            this.kind = kind;
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public boolean equals(final Object obj) {
+            if (obj == this) {
+                return true;
+            }
+            if (!(obj instanceof TypeBinding)) {
+                return false;
+            }
+            final TypeBinding other = (TypeBinding) obj;
+            return Objects.equals(variable, other.variable) && Objects.equals(type, other.type) && kind == other.kind;
+        }
+
+        /**
+         * Gets the binding kind.
+         *
+         * @return the binding kind.
+         */
+        public Kind getKind() {
+            return kind;
+        }
+
+        /**
+         * Gets the associated type; {@code null} when the kind is {@link Kind#UNKNOWN}.
+         *
+         * @return the associated type, possibly {@code null}.
+         */
+        public Type getType() {
+            return type;
+        }
+
+        /**
+         * Gets the bound type variable.
+         *
+         * @return the bound type variable.
+         */
+        public TypeVariable<?> getVariable() {
+            return variable;
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public int hashCode() {
+            return Objects.hash(variable, type, kind);
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public String toString() {
+            return variable.getName() + " -> " + (type == null ? "?" : TypeUtils.toString(type)) + " (" + kind + ")";
+        }
+    }
+
+    /**
+     * An explicit generic binding report produced by {@link TypeUtils#getTypeBindingReport(Type, Class)}. The report maps each observed
+     * {@link TypeVariable} to the list of {@link TypeBinding}s found while walking the real supertype hierarchy of the subject towards the target class.
+     * Multiple bindings for the same variable are preserved, so conflicting inheritance paths are not silently merged. When assignability cannot be
+     * proven the report is marked {@linkplain #isUndecided() undecided} instead of presenting {@link Object} as the answer.
+     *
+     * @since 3.21.1
+     */
+    public static final class TypeBindingReport {
+        private final Type subject;
+        private final Class<?> toClass;
+        private final Map<TypeVariable<?>, List<TypeBinding>> bindings = new LinkedHashMap<>();
+        private boolean undecided;
+
+        /**
+         * Constructs a new instance.
+         *
+         * @param subject the reported subject type.
+         * @param toClass the target class.
+         */
+        TypeBindingReport(final Type subject, final Class<?> toClass) {
+            this.subject = subject;
+            this.toClass = toClass;
+        }
+
+        /**
+         * Adds a binding, dropping exact duplicates produced by converging inheritance paths.
+         *
+         * @param binding the binding to add.
+         */
+        void addBinding(final TypeBinding binding) {
+            final List<TypeBinding> list = bindings.computeIfAbsent(binding.getVariable(), key -> new ArrayList<>());
+            if (!list.contains(binding)) {
+                list.add(binding);
+            }
+        }
+
+        /**
+         * Tests whether any binding was recorded for {@code variable}.
+         *
+         * @param variable the type variable.
+         * @return whether the variable has bindings.
+         */
+        private boolean containsVariable(final TypeVariable<?> variable) {
+            return bindings.containsKey(variable);
+        }
+
+        /**
+         * Gets all recorded bindings, keyed by type variable. Variables with conflicting paths map to more than one binding.
+         *
+         * @return an unmodifiable map of variables to their unmodifiable binding lists.
+         */
+        public Map<TypeVariable<?>, List<TypeBinding>> getBindings() {
+            final Map<TypeVariable<?>, List<TypeBinding>> copy = new LinkedHashMap<>();
+            bindings.forEach((variable, list) -> copy.put(variable, Collections.unmodifiableList(list)));
+            return Collections.unmodifiableMap(copy);
+        }
+
+        /**
+         * Gets the bindings recorded for {@code variable}.
+         *
+         * @param variable the type variable, not {@code null}.
+         * @return an unmodifiable list of bindings, possibly empty.
+         */
+        public List<TypeBinding> getBindings(final TypeVariable<?> variable) {
+            return getBindings().getOrDefault(Objects.requireNonNull(variable, "variable"), Collections.emptyList());
+        }
+
+        /**
+         * Gets the target class of this report.
+         *
+         * @return the target class.
+         */
+        public Class<?> getToClass() {
+            return toClass;
+        }
+
+        /**
+         * Gets the variables for which bindings were recorded.
+         *
+         * @return an unmodifiable set of type variables.
+         */
+        public Set<TypeVariable<?>> getVariables() {
+            return Collections.unmodifiableSet(bindings.keySet());
+        }
+
+        /**
+         * Tests whether any variable carries more than one distinct binding, which happens when conflicting inheritance paths were preserved.
+         *
+         * @return whether conflicting bindings exist.
+         */
+        public boolean hasConflicts() {
+            return bindings.values().stream().anyMatch(list -> list.size() > 1);
+        }
+
+        /**
+         * Tests whether the report encountered a situation in which assignability could not be proven, for example an unknown wildcard argument, an
+         * unresolvable type variable, or a subject that is not assignable to the target class. In such cases no {@link Object} fallback is reported.
+         *
+         * @return whether the report is undecided.
+         */
+        public boolean isUndecided() {
+            return undecided;
+        }
+
+        /**
+         * Marks this report as undecided.
+         */
+        private void markUndecided() {
+            undecided = true;
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public String toString() {
+            final StringBuilder builder = new StringBuilder("TypeBindingReport[");
+            builder.append(TypeUtils.toString(subject)).append(" => ").append(toClass.getName());
+            if (undecided) {
+                builder.append(", UNDECIDED");
+            }
+            bindings.forEach((variable, list) -> list.forEach(binding -> builder.append("; ").append(binding)));
+            return builder.append(']').toString();
         }
     }
 
@@ -926,6 +1155,338 @@ public class TypeUtils {
             return null;
         }
         throw new IllegalStateException("found an unhandled type: " + type);
+    }
+
+    /**
+     * Builds an explicit generic binding report mapping the {@link TypeVariable}s observed on the real supertype hierarchy from {@code type} to
+     * {@code toClass} onto their type arguments.
+     *
+     * <p>
+     * Unlike {@link #getTypeArguments(Type, Class)}, which collapses its findings into a single map, this method records one
+     * {@link TypeBinding} per observation and classifies it as {@link TypeBinding.Kind#EXACT EXACT}, {@link TypeBinding.Kind#UPPER_BOUND UPPER_BOUND},
+     * {@link TypeBinding.Kind#LOWER_BOUND LOWER_BOUND}, {@link TypeBinding.Kind#UNKNOWN UNKNOWN} or {@link TypeBinding.Kind#UNRESOLVED UNRESOLVED}, so
+     * wildcard upper bounds, wildcard lower bounds and unknown arguments stay distinguishable. Conflicting inheritance paths are preserved as multiple
+     * bindings of the same variable instead of being overwritten. Recursive (self-referencing) bounds are represented finitely: expansion stops at the
+     * first repeated variable. Only reflection metadata is read, so no class is initialized and no user method is invoked. Whenever assignability cannot
+     * be proven, the report is marked {@linkplain TypeBindingReport#isUndecided() undecided} rather than answering with {@link Object}.
+     * </p>
+     *
+     * @param type    The subject type from which bindings towards {@code toClass} are reported, not {@code null}.
+     * @param toClass The target class whose type variables are to be bound, not {@code null}.
+     * @return A {@link TypeBindingReport} with every binding observed along the real parent types.
+     * @throws NullPointerException Thrown if either {@code type} or {@code toClass} is {@code null}.
+     * @since 3.21.1
+     */
+    public static TypeBindingReport getTypeBindingReport(final Type type, final Class<?> toClass) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(toClass, "toClass");
+        final TypeBindingReport report = new TypeBindingReport(type, toClass);
+        collectBindings(type, toClass, report, Collections.emptyMap(), Collections.newSetFromMap(new IdentityHashMap<>()));
+        return report;
+    }
+
+    /**
+     * Collects bindings from {@code type} towards {@code toClass} into {@code report}.
+     *
+     * @param type     The current type.
+     * @param toClass  The target class.
+     * @param report   The report to fill.
+     * @param assigns  Variable assignments visible at this point of the hierarchy.
+     * @param visiting Types currently on the traversal stack, guarding against self-referencing bounds.
+     */
+    private static void collectBindings(final Type type, final Class<?> toClass, final TypeBindingReport report, final Map<TypeVariable<?>, Type> assigns,
+            final Set<Type> visiting) {
+        if (type == null) {
+            report.markUndecided();
+            return;
+        }
+        if (!visiting.add(type)) {
+            // A self-referencing bound led back here; the finite report already holds the symbol.
+            return;
+        }
+        try {
+            if (type instanceof Class<?>) {
+                collectFromClass((Class<?>) type, toClass, report, assigns, visiting);
+            } else if (type instanceof ParameterizedType) {
+                collectFromParameterized((ParameterizedType) type, toClass, report, assigns, visiting);
+            } else if (type instanceof TypeVariable<?>) {
+                final Type mapped = assigns.get(type);
+                if (mapped != null && !mapped.equals(type)) {
+                    collectBindings(mapped, toClass, report, assigns, visiting);
+                    return;
+                }
+                boolean boundFound = false;
+                for (final Type bound : getImplicitBounds((TypeVariable<?>) type)) {
+                    if (!Object.class.equals(bound)) {
+                        collectBindings(bound, toClass, report, assigns, visiting);
+                        boundFound = true;
+                    }
+                }
+                if (!boundFound) {
+                    // A lone Object bound proves nothing; Object is not reported as the answer.
+                    report.markUndecided();
+                }
+            } else if (type instanceof WildcardType) {
+                final WildcardType wildcardType = (WildcardType) type;
+                boolean boundFound = false;
+                for (final Type bound : getImplicitUpperBounds(wildcardType)) {
+                    if (!Object.class.equals(bound)) {
+                        collectBindings(bound, toClass, report, assigns, visiting);
+                        boundFound = true;
+                    }
+                }
+                if (!boundFound || wildcardType.getLowerBounds().length > 0) {
+                    // An unbounded or lower-bounded wildcard subject cannot prove assignability.
+                    report.markUndecided();
+                }
+            } else if (type instanceof GenericArrayType) {
+                if (toClass.isArray()) {
+                    collectBindings(((GenericArrayType) type).getGenericComponentType(), toClass.getComponentType(), report, assigns, visiting);
+                } else if (!Object.class.equals(toClass)) {
+                    report.markUndecided();
+                }
+            } else {
+                report.markUndecided();
+            }
+        } finally {
+            visiting.remove(type);
+        }
+    }
+
+    /**
+     * Collects bindings from a raw class subject by walking its real generic supertypes.
+     *
+     * @param cls       The current class.
+     * @param toClass   The target class.
+     * @param report    The report to fill.
+     * @param assigns   Variable assignments visible at this point of the hierarchy.
+     * @param visiting  Types currently on the traversal stack.
+     */
+    private static void collectFromClass(Class<?> cls, final Class<?> toClass, final TypeBindingReport report, final Map<TypeVariable<?>, Type> assigns,
+            final Set<Type> visiting) {
+        if (cls.isPrimitive()) {
+            if (toClass.isPrimitive()) {
+                return;
+            }
+            cls = ClassUtils.primitiveToWrapper(cls);
+        }
+        if (!isAssignable(cls, toClass)) {
+            // Assignability cannot be proven; do not guess.
+            report.markUndecided();
+            return;
+        }
+        if (cls.equals(toClass)) {
+            // Reached the target raw class: keep its own variables as unresolved symbols unless already bound.
+            for (final TypeVariable<?> variable : cls.getTypeParameters()) {
+                if (!report.containsVariable(variable)) {
+                    bindVariable(report, variable, variable, assigns);
+                }
+            }
+            return;
+        }
+        for (final Type parent : directSupertypes(cls)) {
+            final Class<?> parentRaw = rawTypeOf(parent);
+            if (parentRaw != null && isAssignable(parentRaw, toClass)) {
+                collectBindings(parent, toClass, report, assigns, visiting);
+            }
+        }
+    }
+
+    /**
+     * Collects bindings from a parameterized subject, binding the raw class's variables to the actual arguments before walking on towards
+     * {@code toClass}.
+     *
+     * @param parameterizedType The current parameterized type.
+     * @param toClass           The target class.
+     * @param report            The report to fill.
+     * @param assigns           Variable assignments visible at this point of the hierarchy.
+     * @param visiting          Types currently on the traversal stack.
+     */
+    private static void collectFromParameterized(final ParameterizedType parameterizedType, final Class<?> toClass, final TypeBindingReport report,
+            final Map<TypeVariable<?>, Type> assigns, final Set<Type> visiting) {
+        final Class<?> raw = getRawType(parameterizedType);
+        if (!isAssignable(raw, toClass)) {
+            report.markUndecided();
+            return;
+        }
+        final TypeVariable<?>[] variables = raw.getTypeParameters();
+        final Type[] arguments = parameterizedType.getActualTypeArguments();
+        final Map<TypeVariable<?>, Type> childAssigns = new HashMap<>(assigns);
+        for (int i = 0; i < variables.length; i++) {
+            childAssigns.put(variables[i], arguments[i]);
+            bindVariable(report, variables[i], arguments[i], assigns);
+        }
+        if (raw.equals(toClass)) {
+            return;
+        }
+        for (final Type parent : directSupertypes(raw)) {
+            final Class<?> parentRaw = rawTypeOf(parent);
+            if (parentRaw != null && isAssignable(parentRaw, toClass)) {
+                collectBindings(parent, toClass, report, childAssigns, visiting);
+            }
+        }
+    }
+
+    /**
+     * Records a single binding of {@code variable} to {@code argument} after substituting the assignments visible at this point, classifying wildcard
+     * upper bounds, wildcard lower bounds, unknown arguments and unresolved variables.
+     *
+     * @param report   The report to fill.
+     * @param variable The type variable to bind.
+     * @param argument The observed argument.
+     * @param assigns  Variable assignments visible at this point of the hierarchy.
+     */
+    private static void bindVariable(final TypeBindingReport report, final TypeVariable<?> variable, final Type argument,
+            final Map<TypeVariable<?>, Type> assigns) {
+        final Type resolved = substituteVariables(argument, assigns, new HashSet<>());
+        if (resolved instanceof WildcardType) {
+            final WildcardType wildcardType = (WildcardType) resolved;
+            boolean recorded = false;
+            for (final Type lower : wildcardType.getLowerBounds()) {
+                report.addBinding(new TypeBinding(variable, lower, TypeBinding.Kind.LOWER_BOUND));
+                recorded = true;
+            }
+            for (final Type upper : getImplicitUpperBounds(wildcardType)) {
+                if (!Object.class.equals(upper)) {
+                    report.addBinding(new TypeBinding(variable, upper, TypeBinding.Kind.UPPER_BOUND));
+                    recorded = true;
+                }
+            }
+            if (!recorded) {
+                // Unbounded wildcard '?': the argument is unknown and Object is not an answer.
+                report.addBinding(new TypeBinding(variable, null, TypeBinding.Kind.UNKNOWN));
+                report.markUndecided();
+            }
+            return;
+        }
+        if (resolved instanceof TypeVariable<?>) {
+            // Unresolvable variable: keep the symbol and expand its bounds finitely.
+            report.addBinding(new TypeBinding(variable, resolved, TypeBinding.Kind.UNRESOLVED));
+            report.markUndecided();
+            expandBounds(report, (TypeVariable<?>) resolved, assigns, Collections.newSetFromMap(new IdentityHashMap<>()));
+            return;
+        }
+        report.addBinding(new TypeBinding(variable, resolved, TypeBinding.Kind.EXACT));
+        if (containsTypeVariables(resolved)) {
+            // The argument still mentions unresolvable variables, so assignability cannot be fully proven.
+            report.markUndecided();
+        }
+    }
+
+    /**
+     * Records the bounds of an unresolved variable as {@link TypeBinding.Kind#UPPER_BOUND} bindings, stopping at repeated variables so that
+     * self-referencing bounds keep a finite representation.
+     *
+     * @param report   The report to fill.
+     * @param variable The unresolved variable.
+     * @param assigns  Variable assignments visible at this point of the hierarchy.
+     * @param visited  Variables already expanded.
+     */
+    private static void expandBounds(final TypeBindingReport report, final TypeVariable<?> variable, final Map<TypeVariable<?>, Type> assigns,
+            final Set<TypeVariable<?>> visited) {
+        if (!visited.add(variable)) {
+            return;
+        }
+        for (final Type bound : getImplicitBounds(variable)) {
+            if (Object.class.equals(bound)) {
+                continue;
+            }
+            final Type resolved = substituteVariables(bound, assigns, new HashSet<>());
+            report.addBinding(new TypeBinding(variable, resolved, TypeBinding.Kind.UPPER_BOUND));
+            if (resolved instanceof TypeVariable<?>) {
+                expandBounds(report, (TypeVariable<?>) resolved, assigns, visited);
+            }
+        }
+    }
+
+    /**
+     * Gets the direct generic supertypes of {@code cls}: its generic interfaces followed by its generic superclass, if any.
+     *
+     * @param cls The class in question.
+     * @return The real parent types of {@code cls}.
+     */
+    private static List<Type> directSupertypes(final Class<?> cls) {
+        final List<Type> result = new ArrayList<>(Arrays.asList(cls.getGenericInterfaces()));
+        final Type superclass = cls.getGenericSuperclass();
+        if (superclass != null) {
+            result.add(superclass);
+        }
+        return result;
+    }
+
+    /**
+     * Gets the raw class of {@code type} if it is a {@link Class} or a {@link ParameterizedType}, otherwise {@code null}.
+     *
+     * @param type The type in question.
+     * @return The raw class or {@code null}.
+     */
+    private static Class<?> rawTypeOf(final Type type) {
+        if (type instanceof Class<?>) {
+            return (Class<?>) type;
+        }
+        if (type instanceof ParameterizedType) {
+            return getRawType((ParameterizedType) type);
+        }
+        return null;
+    }
+
+    /**
+     * Substitutes the variables of {@code type} with their assignments, keeping unassigned variables as symbols and stopping at repeated variables so
+     * that self-referencing assignments stay finite. Generic array types are rebuilt with their substituted component type.
+     *
+     * @param type    The type in which to substitute.
+     * @param assigns Variable assignments.
+     * @param visited Variables already substituted on this branch.
+     * @return The substituted type, or {@code type} itself when nothing changed.
+     */
+    private static Type substituteVariables(final Type type, final Map<TypeVariable<?>, Type> assigns, final Set<TypeVariable<?>> visited) {
+        if (type instanceof TypeVariable<?>) {
+            final TypeVariable<?> variable = (TypeVariable<?>) type;
+            final Type mapped = assigns.get(variable);
+            if (mapped == null || !visited.add(variable)) {
+                // Unknown variables keep their symbol.
+                return variable;
+            }
+            final Type result = substituteVariables(mapped, assigns, visited);
+            visited.remove(variable);
+            return result;
+        }
+        if (type instanceof ParameterizedType) {
+            final ParameterizedType parameterizedType = (ParameterizedType) type;
+            final Type[] arguments = parameterizedType.getActualTypeArguments();
+            final Type[] newArguments = substituteVariables(arguments, assigns, visited);
+            return Arrays.equals(newArguments, arguments) ? type
+                    : parameterizeWithOwner(parameterizedType.getOwnerType(), (Class<?>) parameterizedType.getRawType(), newArguments);
+        }
+        if (type instanceof GenericArrayType) {
+            final Type componentType = ((GenericArrayType) type).getGenericComponentType();
+            final Type newComponentType = substituteVariables(componentType, assigns, visited);
+            return newComponentType == componentType ? type : genericArrayType(newComponentType);
+        }
+        if (type instanceof WildcardType) {
+            final WildcardType wildcardType = (WildcardType) type;
+            final Type[] newUpperBounds = substituteVariables(wildcardType.getUpperBounds(), assigns, visited);
+            final Type[] newLowerBounds = substituteVariables(wildcardType.getLowerBounds(), assigns, visited);
+            return Arrays.equals(newUpperBounds, wildcardType.getUpperBounds()) && Arrays.equals(newLowerBounds, wildcardType.getLowerBounds()) ? type
+                    : wildcardType().withUpperBounds(newUpperBounds).withLowerBounds(newLowerBounds).build();
+        }
+        return type;
+    }
+
+    /**
+     * Substitutes the variables of each element of {@code types}.
+     *
+     * @param types   The types in which to substitute.
+     * @param assigns Variable assignments.
+     * @param visited Variables already substituted on this branch.
+     * @return A new array with the substituted types.
+     */
+    private static Type[] substituteVariables(final Type[] types, final Map<TypeVariable<?>, Type> assigns, final Set<TypeVariable<?>> visited) {
+        final Type[] result = types.clone();
+        for (int i = 0; i < result.length; i++) {
+            result[i] = substituteVariables(types[i], assigns, visited);
+        }
+        return result;
     }
 
     /**
