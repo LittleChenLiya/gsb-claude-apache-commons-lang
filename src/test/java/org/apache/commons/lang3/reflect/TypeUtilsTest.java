@@ -1655,4 +1655,210 @@ class TypeUtilsTest<B> extends AbstractLangTest {
         assertEquals(String.class, TypeUtils.wrap(String.class).getType());
     }
 
+    // -----------------------------------------------------------------------
+    // TypeBinding tests
+    // -----------------------------------------------------------------------
+
+    /**
+     * Test fixture: a child class that binds {@code List}'s type variable to {@code String}.
+     */
+    static class StringList extends ArrayList<String> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Test fixture: a type variable with a self-referencing bound.
+     */
+    static class SelfRef<T extends Comparable<T>> {
+        // empty
+    }
+
+    /**
+     * Test fixture: a raw class whose type variables are unresolvable.
+     */
+    @SuppressWarnings("rawtypes")
+    static class RawList extends ArrayList {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Test fixture: probes whether class initialization is triggered.
+     */
+    static class ClassInitProbe {
+        static int initCount;
+        static {
+            initCount++;
+        }
+    }
+
+    /**
+     * Test fixture: holds a field whose generic type references {@link ClassInitProbe} without initializing it.
+     */
+    static class ClassInitProbeHolder {
+        static List<ClassInitProbe> field;
+    }
+
+    /**
+     * Test fixture: a child class that binds {@code List}'s type variable to {@code String[]}.
+     */
+    static class StringArrayList extends ArrayList<String[]> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Test fixture: an inner class whose type parameter shadows the outer class's type parameter and which extends
+     * the outer class. When resolving to the outer class, the same type variable is bound through both the owner
+     * path and the parent path, producing a conflict.
+     */
+    static class Outer<T> {
+        class Inner<T> extends Outer<T> {
+            // empty
+        }
+    }
+
+    @Test
+    void testTypeBindingsChildClassBindsTypeVariable() {
+        // A child class List<String> maps List's type variable T to String correctly.
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(StringList.class, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding, "binding for List's type variable should be present");
+        assertTrue(binding.isExact(), "binding should be exact: " + binding);
+        assertEquals(String.class, binding.getBound());
+        assertFalse(binding.isUnresolved());
+        assertFalse(binding.hasConflicts());
+    }
+
+    @Test
+    void testTypeBindingsSelfReferencingBoundDoesNotLoop() {
+        // A self-referencing bound must not cause infinite recursion.
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(SelfRef.class, SelfRef.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> t = SelfRef.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(t);
+        assertNotNull(binding);
+        // The raw class does not bind T to anything, so it must remain unknown/unresolved with its symbol preserved.
+        assertTrue(binding.isUnknown() || binding.isUnresolved(), "binding should be unknown/unresolved: " + binding);
+        assertEquals(t, binding.getVariable());
+    }
+
+    @Test
+    void testTypeBindingsUnknownVariablesKeepSymbols() {
+        // Unknown variables keep their symbols rather than being replaced by Object.
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(RawList.class, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding, "binding for List's type variable should be present");
+        assertTrue(binding.isUnknown(), "binding should be unknown: " + binding);
+        assertNull(binding.getBound(), "unknown binding should have no bound");
+        // The variable's symbol must be preserved.
+        assertEquals(listE, binding.getVariable());
+    }
+
+    @Test
+    void testTypeBindingsNoClassInitialization() throws NoSuchFieldException {
+        // Resolving type bindings must not trigger class initialization.
+        final Field field = ClassInitProbeHolder.class.getDeclaredField("field");
+        final Type fieldType = field.getGenericType();
+        final int before = ClassInitProbe.initCount;
+        TypeUtils.getTypeBindings(fieldType, List.class);
+        assertEquals(before, ClassInitProbe.initCount, "class initializer must not be triggered");
+    }
+
+    @Test
+    void testTypeBindingsGenericArrayRepresented() {
+        // A generic array type argument is represented.
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(StringArrayList.class, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding);
+        assertTrue(binding.isExact(), "binding should be exact: " + binding);
+        assertEquals(String[].class, binding.getBound());
+    }
+
+    @Test
+    void testTypeBindingsWildcardUpperBound() {
+        // ? extends Number is distinguished as an upper bound, not collapsed to Number or Object.
+        final ParameterizedType pt = TypeUtils.parameterize(ArrayList.class,
+                TypeUtils.wildcardType().withUpperBounds(Number.class).build());
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(pt, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding);
+        assertTrue(binding.isUpperBound(), "binding should be an upper bound: " + binding);
+        assertEquals(Number.class, binding.getBound());
+        assertFalse(binding.isUnresolved());
+    }
+
+    @Test
+    void testTypeBindingsWildcardLowerBound() {
+        // ? super Number is distinguished as a lower bound.
+        final ParameterizedType pt = TypeUtils.parameterize(ArrayList.class,
+                TypeUtils.wildcardType().withLowerBounds(Number.class).build());
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(pt, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding);
+        assertTrue(binding.isLowerBound(), "binding should be a lower bound: " + binding);
+        assertEquals(Number.class, binding.getBound());
+        assertFalse(binding.isUnresolved());
+    }
+
+    @Test
+    void testTypeBindingsWildcardUnknown() {
+        // ? (no explicit bounds) is distinguished as unknown, not replaced by Object.
+        final ParameterizedType pt = TypeUtils.parameterize(ArrayList.class, TypeUtils.wildcardType().build());
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(pt, List.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> listE = List.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(listE);
+        assertNotNull(binding);
+        assertTrue(binding.isUnknown(), "binding should be unknown: " + binding);
+        assertNull(binding.getBound(), "unknown binding should have no bound");
+    }
+
+    @Test
+    void testTypeBindingsUnrelatedTypesReturnNull() {
+        // Types that are not assignable return null, not a map filled with Object.
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(StringList.class, Map.class);
+        assertNull(bindings);
+    }
+
+    @Test
+    void testTypeBindingsPreservesExistingIsAssignable() {
+        // The ordinary isAssignable behavior is preserved.
+        assertTrue(TypeUtils.isAssignable(StringList.class, List.class));
+        assertTrue(TypeUtils.isAssignable(StringList.class, ArrayList.class));
+        assertFalse(TypeUtils.isAssignable(StringList.class, Map.class));
+        assertTrue(TypeUtils.isAssignable(StringArrayList.class, List.class));
+        assertTrue(TypeUtils.isAssignable(StringArrayList.class, ArrayList.class));
+    }
+
+    @Test
+    void testTypeBindingsConflictPathsArePreserved() {
+        // When the same type variable is bound differently through alternate paths, the conflicts are kept.
+        // Outer<String>.Inner<Integer> resolves to Outer.class:
+        //   owner path binds Outer's T to String; parent path (Inner extends Outer<T>) binds Outer's T to Integer.
+        final ParameterizedType outerType = TypeUtils.parameterize(Outer.class, String.class);
+        final ParameterizedType innerType = TypeUtils.parameterizeWithOwner(outerType, Outer.Inner.class, Integer.class);
+        final Map<TypeVariable<?>, TypeUtils.TypeBinding> bindings = TypeUtils.getTypeBindings(innerType, Outer.class);
+        assertNotNull(bindings);
+        final TypeVariable<?> outerT = Outer.class.getTypeParameters()[0];
+        final TypeUtils.TypeBinding binding = bindings.get(outerT);
+        assertNotNull(binding, "binding for Outer's type variable should be present");
+        assertTrue(binding.hasConflicts(), "binding should have conflicts: " + binding);
+        // The primary binding comes from the owner path (String); the conflict from the parent path (Integer).
+        assertTrue(binding.isExact(), "primary binding should be exact: " + binding);
+        assertEquals(String.class, binding.getBound());
+        assertEquals(1, binding.getConflicts().size());
+        final TypeUtils.TypeBinding conflict = binding.getConflicts().get(0);
+        assertTrue(conflict.isExact(), "conflict should be exact: " + conflict);
+        assertEquals(Integer.class, conflict.getBound());
+    }
+
 }

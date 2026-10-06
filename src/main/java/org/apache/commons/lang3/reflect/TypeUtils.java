@@ -24,6 +24,7 @@ import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.lang.reflect.WildcardType;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -219,6 +220,268 @@ public class TypeUtils {
         public WildcardTypeBuilder withUpperBounds(final Type... bounds) {
             this.upperBounds = bounds;
             return this;
+        }
+    }
+
+    /**
+     * Represents the explicit binding of a {@link TypeVariable} along the generic inheritance hierarchy.
+     *
+     * <p>
+     * A binding describes what a type variable is bound to, distinguishing between:
+     * </p>
+     * <ul>
+     * <li>{@link Kind#EXACT} - an exact type argument (e.g. {@code String}).</li>
+     * <li>{@link Kind#UPPER_BOUND} - a wildcard upper bound (e.g. {@code ? extends Number}).</li>
+     * <li>{@link Kind#LOWER_BOUND} - a wildcard lower bound (e.g. {@code ? super Number}).</li>
+     * <li>{@link Kind#UNKNOWN} - an unresolvable or wildcard-without-bounds binding, whose symbol is preserved rather than replaced by {@link Object}.</li>
+     * </ul>
+     *
+     * <p>
+     * When the same type variable is reached through multiple inheritance paths that disagree, the first binding is retained and the alternatives are
+     * available via {@link #getConflicts()}. When assignability cannot be proven, the binding is flagged {@link #isUnresolved()}.
+     * </p>
+     *
+     * @since 3.21
+     */
+    public static final class TypeBinding {
+
+        /**
+         * The kind of binding.
+         */
+        public enum Kind {
+            /** An exact type argument, e.g. {@code String}. */
+            EXACT,
+            /** A wildcard upper bound, e.g. {@code ? extends Number}. */
+            UPPER_BOUND,
+            /** A wildcard lower bound, e.g. {@code ? super Number}. */
+            LOWER_BOUND,
+            /** An unresolvable or wildcard-without-bounds binding. */
+            UNKNOWN
+        }
+
+        private final TypeVariable<?> variable;
+        private final Kind kind;
+        private final Type bound;
+        private final boolean unresolved;
+        private final List<TypeBinding> conflicts;
+
+        private TypeBinding(final TypeVariable<?> variable, final Kind kind, final Type bound, final boolean unresolved,
+                final List<TypeBinding> conflicts) {
+            this.variable = variable;
+            this.kind = Objects.requireNonNull(kind, "kind");
+            this.bound = bound;
+            this.unresolved = unresolved;
+            this.conflicts = conflicts == null ? Collections.emptyList() : Collections.unmodifiableList(new ArrayList<>(conflicts));
+        }
+
+        /**
+         * Creates an exact binding.
+         *
+         * @param bound the exact type, not {@code null}.
+         * @return a new exact binding.
+         */
+        public static TypeBinding exact(final Type bound) {
+            return new TypeBinding(null, Kind.EXACT, Objects.requireNonNull(bound, "bound"), false, null);
+        }
+
+        /**
+         * Creates a wildcard upper-bound binding.
+         *
+         * @param bound the upper bound type, not {@code null}.
+         * @return a new upper-bound binding.
+         */
+        public static TypeBinding upperBound(final Type bound) {
+            return new TypeBinding(null, Kind.UPPER_BOUND, Objects.requireNonNull(bound, "bound"), false, null);
+        }
+
+        /**
+         * Creates a wildcard lower-bound binding.
+         *
+         * @param bound the lower bound type, not {@code null}.
+         * @return a new lower-bound binding.
+         */
+        public static TypeBinding lowerBound(final Type bound) {
+            return new TypeBinding(null, Kind.LOWER_BOUND, Objects.requireNonNull(bound, "bound"), false, null);
+        }
+
+        /**
+         * Creates an unknown binding (wildcard without explicit bounds or unresolvable).
+         *
+         * @return a new unknown binding.
+         */
+        public static TypeBinding unknown() {
+            return new TypeBinding(null, Kind.UNKNOWN, null, false, null);
+        }
+
+        /**
+         * Creates an unresolved binding that preserves the variable's symbol.
+         *
+         * @param variable the unresolved type variable, not {@code null}.
+         * @return a new unresolved binding.
+         */
+        public static TypeBinding unresolved(final TypeVariable<?> variable) {
+            return new TypeBinding(Objects.requireNonNull(variable, "variable"), Kind.UNKNOWN, null, true, null);
+        }
+
+        /**
+         * Gets the type variable this binding describes.
+         *
+         * @return the type variable, or {@code null} if not yet associated.
+         */
+        public TypeVariable<?> getVariable() {
+            return variable;
+        }
+
+        /**
+         * Gets the kind of binding.
+         *
+         * @return the kind.
+         */
+        public Kind getKind() {
+            return kind;
+        }
+
+        /**
+         * Gets the bound type.
+         *
+         * @return the bound type, or {@code null} for {@link Kind#UNKNOWN}.
+         */
+        public Type getBound() {
+            return bound;
+        }
+
+        /**
+         * Tests whether this binding is exact.
+         *
+         * @return {@code true} if exact.
+         */
+        public boolean isExact() {
+            return kind == Kind.EXACT;
+        }
+
+        /**
+         * Tests whether this binding is a wildcard upper bound.
+         *
+         * @return {@code true} if upper bound.
+         */
+        public boolean isUpperBound() {
+            return kind == Kind.UPPER_BOUND;
+        }
+
+        /**
+         * Tests whether this binding is a wildcard lower bound.
+         *
+         * @return {@code true} if lower bound.
+         */
+        public boolean isLowerBound() {
+            return kind == Kind.LOWER_BOUND;
+        }
+
+        /**
+         * Tests whether this binding is unknown.
+         *
+         * @return {@code true} if unknown.
+         */
+        public boolean isUnknown() {
+            return kind == Kind.UNKNOWN;
+        }
+
+        /**
+         * Tests whether this binding is unresolved (assignability could not be proven).
+         *
+         * @return {@code true} if unresolved.
+         */
+        public boolean isUnresolved() {
+            return unresolved;
+        }
+
+        /**
+         * Gets the conflicting bindings for the same type variable reached through alternate inheritance paths.
+         *
+         * @return an unmodifiable list of conflicts, never {@code null}.
+         */
+        public List<TypeBinding> getConflicts() {
+            return conflicts;
+        }
+
+        /**
+         * Tests whether this binding has conflicts.
+         *
+         * @return {@code true} if conflicts exist.
+         */
+        public boolean hasConflicts() {
+            return !conflicts.isEmpty();
+        }
+
+        /**
+         * Returns a copy of this binding associated with the specified type variable.
+         *
+         * @param typeVariable the type variable, not {@code null}.
+         * @return a new binding with the variable set.
+         */
+        public TypeBinding withVariable(final TypeVariable<?> typeVariable) {
+            return new TypeBinding(Objects.requireNonNull(typeVariable, "typeVariable"), kind, bound, unresolved, conflicts);
+        }
+
+        /**
+         * Returns a copy of this binding with an additional conflict recorded.
+         *
+         * @param conflict the conflicting binding, not {@code null}.
+         * @return a new binding with the conflict added.
+         */
+        public TypeBinding withConflict(final TypeBinding conflict) {
+            Objects.requireNonNull(conflict, "conflict");
+            final List<TypeBinding> newConflicts = new ArrayList<>(conflicts);
+            newConflicts.add(conflict);
+            return new TypeBinding(variable, kind, bound, unresolved, newConflicts);
+        }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (obj == this) {
+                return true;
+            }
+            if (!(obj instanceof TypeBinding)) {
+                return false;
+            }
+            final TypeBinding other = (TypeBinding) obj;
+            return unresolved == other.unresolved && kind == other.kind && Objects.equals(variable, other.variable)
+                    && Objects.equals(bound, other.bound);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(variable, kind, bound, unresolved);
+        }
+
+        @Override
+        public String toString() {
+            final StringBuilder sb = new StringBuilder();
+            if (variable != null) {
+                sb.append(variable.getName()).append('=');
+            }
+            switch (kind) {
+            case EXACT:
+                sb.append(bound != null ? TypeUtils.toString(bound) : "null");
+                break;
+            case UPPER_BOUND:
+                sb.append("? extends ").append(bound != null ? TypeUtils.toString(bound) : "null");
+                break;
+            case LOWER_BOUND:
+                sb.append("? super ").append(bound != null ? TypeUtils.toString(bound) : "null");
+                break;
+            case UNKNOWN:
+            default:
+                sb.append('?');
+                break;
+            }
+            if (unresolved) {
+                sb.append(" (unresolved)");
+            }
+            if (!conflicts.isEmpty()) {
+                sb.append(" conflicts=").append(conflicts);
+            }
+            return sb.toString();
         }
     }
 
@@ -926,6 +1189,298 @@ public class TypeUtils {
             return null;
         }
         throw new IllegalStateException("found an unhandled type: " + type);
+    }
+
+    /**
+     * Gets an explicit report of the {@link TypeBinding}s for every type variable in the generic inheritance hierarchy from {@code type} to {@code toClass}.
+     *
+     * <p>
+     * Unlike {@link #getTypeArguments(Type, Class)}, this method:
+     * </p>
+     * <ul>
+     * <li>Preserves wildcard bound kinds ({@link TypeBinding.Kind#UPPER_BOUND}, {@link TypeBinding.Kind#LOWER_BOUND}, {@link TypeBinding.Kind#UNKNOWN}) rather
+     * than collapsing them to a single type.</li>
+     * <li>Keeps the symbols of unresolvable variables instead of substituting {@link Object}.</li>
+     * <li>Records conflicting bindings reached through alternate inheritance paths via {@link TypeBinding#getConflicts()}.</li>
+     * <li>Flags bindings whose assignability cannot be proven as {@link TypeBinding#isUnresolved()}.</li>
+     * <li>Handles self-referencing and recursive bounds without infinite recursion.</li>
+     * </ul>
+     *
+     * <p>
+     * This method does not trigger class initialization or invoke user methods; it relies solely on reflective generic type metadata.
+     * </p>
+     *
+     * @param type    the type from which to resolve type variables, not {@code null}.
+     * @param toClass the target class whose type variables are to be resolved, not {@code null}.
+     * @return a map from type variable to its binding, or {@code null} if {@code type} is not assignable to {@code toClass}.
+     * @throws NullPointerException if either argument is {@code null}.
+     * @since 3.21
+     */
+    public static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final Type type, final Class<?> toClass) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(toClass, "toClass");
+        return getTypeBindings(type, toClass, new HashMap<>(), new HashSet<>());
+    }
+
+    /**
+     * Recursively builds the type binding report.
+     *
+     * @param type     the subject type.
+     * @param toClass  the target class.
+     * @param bindings the bindings accumulated so far.
+     * @param visited  type variables currently being resolved (cycle detection).
+     * @return the bindings map, or {@code null} if not assignable.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final Type type, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        if (type instanceof Class<?>) {
+            return getTypeBindings((Class<?>) type, toClass, bindings, visited);
+        }
+        if (type instanceof ParameterizedType) {
+            return getTypeBindings((ParameterizedType) type, toClass, bindings, visited);
+        }
+        if (type instanceof GenericArrayType) {
+            return getTypeBindings((GenericArrayType) type, toClass, bindings, visited);
+        }
+        if (type instanceof WildcardType) {
+            return getTypeBindings((WildcardType) type, toClass, bindings, visited);
+        }
+        if (type instanceof TypeVariable<?>) {
+            return getTypeBindings((TypeVariable<?>) type, toClass, bindings, visited);
+        }
+        throw new IllegalStateException("found an unhandled type: " + type);
+    }
+
+    /**
+     * Builds bindings for a raw class.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final Class<?> cls, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        if (!isAssignable(cls, toClass)) {
+            return null;
+        }
+        final Map<TypeVariable<?>, TypeBinding> newBindings = new HashMap<>(bindings);
+        if (toClass.equals(cls)) {
+            // raw class: its type parameters are unresolvable; preserve their symbols
+            for (final TypeVariable<?> typeParam : cls.getTypeParameters()) {
+                newBindings.putIfAbsent(typeParam, TypeBinding.unresolved(typeParam));
+            }
+            return newBindings;
+        }
+        return getTypeBindings(getClosestParentType(cls, toClass), toClass, newBindings, visited);
+    }
+
+    /**
+     * Builds bindings for a parameterized type.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final ParameterizedType parameterizedType, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        final Class<?> cls = getRawType(parameterizedType);
+        if (!isAssignable(cls, toClass)) {
+            return null;
+        }
+        final Type ownerType = parameterizedType.getOwnerType();
+        final Map<TypeVariable<?>, TypeBinding> newBindings;
+        if (ownerType instanceof ParameterizedType) {
+            newBindings = getTypeBindings((ParameterizedType) ownerType, getRawType((ParameterizedType) ownerType), bindings, visited);
+            if (newBindings == null) {
+                return null;
+            }
+        } else {
+            newBindings = new HashMap<>(bindings);
+        }
+        final Type[] typeArgs = parameterizedType.getActualTypeArguments();
+        final TypeVariable<?>[] typeParams = cls.getTypeParameters();
+        for (int i = 0; i < typeParams.length; i++) {
+            final TypeBinding binding = toTypeBinding(typeArgs[i], newBindings, visited);
+            mergeBinding(newBindings, typeParams[i], binding);
+        }
+        if (toClass.equals(cls)) {
+            return newBindings;
+        }
+        final Type parentType = getClosestParentType(cls, toClass);
+        if (parentType instanceof ParameterizedType) {
+            final ParameterizedType parameterizedParentType = (ParameterizedType) parentType;
+            final Type[] parentTypeArgs = parameterizedParentType.getActualTypeArguments().clone();
+            for (int i = 0; i < parentTypeArgs.length; i++) {
+                parentTypeArgs[i] = resolveType(parentTypeArgs[i], newBindings, visited);
+            }
+            return getTypeBindings(
+                    parameterizeWithOwner(parameterizedParentType.getOwnerType(), (Class<?>) parameterizedParentType.getRawType(), parentTypeArgs),
+                    toClass, newBindings, visited);
+        }
+        return getTypeBindings(parentType, toClass, newBindings, visited);
+    }
+
+    /**
+     * Builds bindings for a generic array type.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final GenericArrayType genericArrayType, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        return getTypeBindings(genericArrayType.getGenericComponentType(),
+                toClass.isArray() ? toClass.getComponentType() : toClass, bindings, visited);
+    }
+
+    /**
+     * Builds bindings for a wildcard type.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final WildcardType wildcardType, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        for (final Type bound : getImplicitUpperBounds(wildcardType)) {
+            if (isAssignable(bound, toClass)) {
+                return getTypeBindings(bound, toClass, bindings, visited);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Builds bindings for a type variable.
+     */
+    private static Map<TypeVariable<?>, TypeBinding> getTypeBindings(final TypeVariable<?> typeVariable, final Class<?> toClass,
+            final Map<TypeVariable<?>, TypeBinding> bindings, final Set<TypeVariable<?>> visited) {
+        if (!visited.add(typeVariable)) {
+            // self-referencing bound: break the cycle, keep what we have
+            return bindings;
+        }
+        try {
+            for (final Type bound : getImplicitBounds(typeVariable)) {
+                if (isAssignable(bound, toClass)) {
+                    return getTypeBindings(bound, toClass, bindings, visited);
+                }
+            }
+            return null;
+        } finally {
+            visited.remove(typeVariable);
+        }
+    }
+
+    /**
+     * Converts a type argument to a {@link TypeBinding}, preserving wildcard bound kinds and propagating transitive type-variable bindings.
+     *
+     * @param type     the type argument.
+     * @param bindings the current bindings.
+     * @param visited  type variables currently being resolved (cycle detection).
+     * @return the binding.
+     */
+    private static TypeBinding toTypeBinding(final Type type, final Map<TypeVariable<?>, TypeBinding> bindings,
+            final Set<TypeVariable<?>> visited) {
+        if (type instanceof TypeVariable<?>) {
+            final TypeVariable<?> var = (TypeVariable<?>) type;
+            if (!visited.add(var)) {
+                // cycle: keep the variable's symbol rather than recursing forever
+                return TypeBinding.unresolved(var);
+            }
+            try {
+                final TypeBinding existing = bindings.get(var);
+                if (existing != null) {
+                    return existing;
+                }
+                // try to resolve from the variable's bounds (skip the default Object bound)
+                for (final Type bound : var.getBounds()) {
+                    if (Object.class.equals(bound)) {
+                        continue;
+                    }
+                    final TypeBinding boundBinding = toTypeBinding(bound, bindings, visited);
+                    if (boundBinding.isExact() && !boundBinding.isUnresolved()) {
+                        return boundBinding;
+                    }
+                }
+                return TypeBinding.unresolved(var);
+            } finally {
+                visited.remove(var);
+            }
+        }
+        if (type instanceof WildcardType) {
+            final WildcardType wt = (WildcardType) type;
+            final Type[] upper = wt.getUpperBounds();
+            final Type[] lower = wt.getLowerBounds();
+            if (lower.length > 0 && lower[0] != null) {
+                return TypeBinding.lowerBound(resolveType(lower[0], bindings, visited));
+            }
+            if (upper.length > 0 && !Object.class.equals(upper[0])) {
+                return TypeBinding.upperBound(resolveType(upper[0], bindings, visited));
+            }
+            return TypeBinding.unknown();
+        }
+        return TypeBinding.exact(resolveType(type, bindings, visited));
+    }
+
+    /**
+     * Resolves type variables in a type to their bound types, but only for exact bindings. Wildcard-bound and unresolved variables keep their symbols so that
+     * recursive bounds have a finite representation.
+     *
+     * @param type     the type to resolve.
+     * @param bindings the current bindings.
+     * @param visited  type variables currently being resolved (cycle detection).
+     * @return the resolved type.
+     */
+    private static Type resolveType(final Type type, final Map<TypeVariable<?>, TypeBinding> bindings,
+            final Set<TypeVariable<?>> visited) {
+        if (type instanceof TypeVariable<?>) {
+            final TypeVariable<?> var = (TypeVariable<?>) type;
+            if (!visited.add(var)) {
+                return var; // cycle: keep symbol
+            }
+            try {
+                final TypeBinding binding = bindings.get(var);
+                if (binding != null && binding.isExact() && binding.getBound() != null) {
+                    return resolveType(binding.getBound(), bindings, visited);
+                }
+                return var; // keep symbol
+            } finally {
+                visited.remove(var);
+            }
+        }
+        if (type instanceof ParameterizedType) {
+            final ParameterizedType pt = (ParameterizedType) type;
+            final Type[] args = pt.getActualTypeArguments();
+            final Type[] resolvedArgs = new Type[args.length];
+            for (int i = 0; i < args.length; i++) {
+                resolvedArgs[i] = resolveType(args[i], bindings, visited);
+            }
+            return parameterizeWithOwner(pt.getOwnerType(), (Class<?>) pt.getRawType(), resolvedArgs);
+        }
+        if (type instanceof GenericArrayType) {
+            final GenericArrayType gat = (GenericArrayType) type;
+            return genericArrayType(resolveType(gat.getGenericComponentType(), bindings, visited));
+        }
+        if (type instanceof WildcardType) {
+            final WildcardType wt = (WildcardType) type;
+            final Type[] upper = wt.getUpperBounds();
+            final Type[] lower = wt.getLowerBounds();
+            final Type[] resolvedUpper = new Type[upper.length];
+            for (int i = 0; i < upper.length; i++) {
+                resolvedUpper[i] = resolveType(upper[i], bindings, visited);
+            }
+            final Type[] resolvedLower = new Type[lower.length];
+            for (int i = 0; i < lower.length; i++) {
+                resolvedLower[i] = resolveType(lower[i], bindings, visited);
+            }
+            return wildcardType().withUpperBounds(resolvedUpper).withLowerBounds(resolvedLower).build();
+        }
+        return type;
+    }
+
+    /**
+     * Merges a new binding for a type variable into the bindings map, retaining conflicts when the same variable is bound differently through alternate paths.
+     *
+     * @param bindings    the bindings map.
+     * @param typeVariable the type variable.
+     * @param newBinding  the new binding.
+     */
+    private static void mergeBinding(final Map<TypeVariable<?>, TypeBinding> bindings, final TypeVariable<?> typeVariable,
+            final TypeBinding newBinding) {
+        final TypeBinding bindingWithVar = newBinding.withVariable(typeVariable);
+        final TypeBinding existing = bindings.get(typeVariable);
+        if (existing == null) {
+            bindings.put(typeVariable, bindingWithVar);
+            return;
+        }
+        if (existing.equals(bindingWithVar)) {
+            return;
+        }
+        bindings.put(typeVariable, existing.withConflict(bindingWithVar));
     }
 
     /**
