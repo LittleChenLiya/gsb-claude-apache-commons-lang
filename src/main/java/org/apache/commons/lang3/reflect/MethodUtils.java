@@ -23,15 +23,19 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -43,6 +47,7 @@ import org.apache.commons.lang3.ClassUtils.Interfaces;
 import org.apache.commons.lang3.Validate;
 import org.apache.commons.lang3.stream.LangCollectors;
 import org.apache.commons.lang3.stream.Streams;
+import org.apache.commons.lang3.tuple.ImmutablePair;
 
 /**
  * Utility reflection methods focused on {@link Method}s, originally from Commons BeanUtils.
@@ -282,55 +287,9 @@ public class MethodUtils {
         A annotation = method.getAnnotation(annotationCls);
         if (annotation == null && searchSupers) {
             final Class<?> mcls = method.getDeclaringClass();
-            final String methodName = method.getName();
-            final Class<?>[] paramTypes = method.getParameterTypes();
             final List<Class<?>> classes = getAllSuperclassesAndInterfaces(mcls);
             for (final Class<?> acls : classes) {
-                // First, attempt an exact parameter-type match (getDeclaredMethod) to
-                // find a true override. This avoids matching unrelated overloads that
-                // are merely assignable-compatible (e.g. process(Integer) vs
-                // process(Number)).
-                Method equivalentMethod = null;
-                try {
-                    equivalentMethod = acls.getDeclaredMethod(methodName, paramTypes);
-                } catch (final NoSuchMethodException ignored) {
-                    // No exact match; check for generic-bridge scenario: the declaring
-                    // class may use a type variable whose erased form is Object (or
-                    // another bound). In that case the parent method's erased
-                    // parameter types differ from the child's concrete types, so we
-                    // scan declared methods for a same-name method whose *erased*
-                    // parameter count matches and whose erased types are assignable
-                    // from our concrete types.
-                    for (final Method candidate : acls.getDeclaredMethods()) {
-                        if (!candidate.getName().equals(methodName)) {
-                            continue;
-                        }
-                        final Class<?>[] candidateParams = candidate.getParameterTypes();
-                        if (candidateParams.length != paramTypes.length) {
-                            continue;
-                        }
-                        // Require that every concrete param type is assignable to the
-                        // candidate's (erased) param type AND that the candidate is
-                        // generic (has at least one TypeVariable in its generic
-                        // parameter types). This prevents matching plain overloads.
-                        boolean genericMatch = false;
-                        boolean paramsMatch = true;
-                        final java.lang.reflect.Type[] genericParams = candidate.getGenericParameterTypes();
-                        for (int i = 0; i < candidateParams.length; i++) {
-                            if (genericParams[i] instanceof java.lang.reflect.TypeVariable) {
-                                genericMatch = true;
-                            }
-                            if (!ClassUtils.isAssignable(paramTypes[i], candidateParams[i], true)) {
-                                paramsMatch = false;
-                                break;
-                            }
-                        }
-                        if (paramsMatch && genericMatch) {
-                            equivalentMethod = candidate;
-                            break;
-                        }
-                    }
-                }
+                final Method equivalentMethod = findOverrideMethod(method, acls);
                 if (equivalentMethod != null && (ignoreAccess || MemberUtils.isAccessible(equivalentMethod))) {
                     annotation = equivalentMethod.getAnnotation(annotationCls);
                     if (annotation != null) {
@@ -340,6 +299,421 @@ public class MethodUtils {
             }
         }
         return annotation;
+    }
+
+    /**
+     * Finds the method in the given class that {@code method} overrides or implements.
+     *
+     * <p>
+     * First, an exact parameter-type match ({@link Class#getDeclaredMethod(String, Class[])}) is attempted to find a true override. This avoids matching
+     * unrelated overloads that are merely assignable-compatible (e.g. {@code process(Integer)} vs {@code process(Number)}).
+     * </p>
+     * <p>
+     * If no exact match exists, the declared methods are scanned for the generic-bridge scenario: the declaring class may use a type variable whose erased
+     * form is {@link Object} (or another bound), so the parent method's erased parameter types differ from the child's concrete types.
+     * </p>
+     * <p>
+     * Finally, if {@code candidateClass} is an interface that merely inherits a method from a super-interface without re-declaring it, the super-interface
+     * graph is walked the same way so an interface diamond can be traversed through its intermediate nodes.
+     * </p>
+     * <p>
+     * Compiler-generated {@link Method#isBridge() bridge} methods are never returned; a non-bridge method declared in the same class with the same
+     * signature is preferred instead.
+     * </p>
+     *
+     * @param method the method whose override to find.
+     * @param candidateClass the class to search.
+     * @return the overridden method, or {@code null} if no true override exists in {@code candidateClass} or its super-interfaces.
+     */
+    private static Method findOverrideMethod(final Method method, final Class<?> candidateClass) {
+        final Method direct = findDeclaredOverrideMethod(method, candidateClass);
+        if (direct != null) {
+            return direct;
+        }
+        if (!candidateClass.isInterface()) {
+            return null;
+        }
+        return findInheritedOverride(method, candidateClass);
+    }
+
+    /**
+     * Resolves one overriding member per direct supertype of {@code method}'s declaring class.
+     *
+     * <p>
+     * A direct supertype that re-declares the override contributes its own member; a direct supertype that only inherits the method is a pass-through edge
+     * that resolves to the first member re-declared in its own super-interface graph. Compiler-generated bridges are never returned. The result may contain
+     * the same {@link Method} more than once when the supertype graph merges; callers de-duplicate as needed.
+     * </p>
+     *
+     * @param method the method whose overrides to resolve.
+     * @return the resolved overridden members, in superclass-then-interface order; never {@code null}.
+     */
+    private static List<Method> findOverriddenMembers(final Method method) {
+        final List<Method> result = new ArrayList<>();
+        final Class<?> declaringClass = method.getDeclaringClass();
+        if (declaringClass.getSuperclass() != null) {
+            final Method overridden = findOverrideMethod(method, declaringClass.getSuperclass());
+            if (overridden != null) {
+                result.add(overridden);
+            }
+        }
+        for (final Class<?> superInterface : declaringClass.getInterfaces()) {
+            final Method overridden = findOverrideMethod(method, superInterface);
+            if (overridden != null) {
+                result.add(overridden);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Resolves a method override through one direct supertype, walking inherited (not re-declared) interface members when the supertype is an interface.
+     *
+     * @param method the method whose override to find.
+     * @param firstType the direct supertype to start from.
+     * @return the overridden member, or {@code null} if none of the nodes re-declares the method.
+     */
+    private static Method findInheritedOverride(final Method method, final Class<?> firstType) {
+        final Method direct = findDeclaredOverrideMethod(method, firstType);
+        if (direct != null) {
+            return direct;
+        }
+        if (!firstType.isInterface()) {
+            return null;
+        }
+        final Set<Class<?>> visited = new LinkedHashSet<>();
+        final Deque<Class<?>> queue = new ArrayDeque<>();
+        visited.add(firstType);
+        queue.add(firstType);
+        while (!queue.isEmpty()) {
+            final Class<?> current = queue.removeFirst();
+            for (final Class<?> superInterface : current.getInterfaces()) {
+                if (!visited.add(superInterface)) {
+                    continue;
+                }
+                final Method found = findDeclaredOverrideMethod(method, superInterface);
+                if (found != null) {
+                    return found;
+                }
+                queue.addLast(superInterface);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Finds a directly declared method that the given method overrides, without walking inherited interface members.
+     *
+     * @param method the method whose override to find.
+     * @param candidateClass the class to search.
+     * @return the overridden method, or {@code null} if no directly declared true override exists.
+     */
+    private static Method findDeclaredOverrideMethod(final Method method, final Class<?> candidateClass) {
+        final String methodName = method.getName();
+        final Class<?>[] paramTypes = method.getParameterTypes();
+        // First, attempt an exact parameter-type match (getDeclaredMethod) to
+        // find a true override. This avoids matching unrelated overloads that
+        // are merely assignable-compatible (e.g. process(Integer) vs
+        // process(Number)).
+        Method equivalentMethod = null;
+        try {
+            equivalentMethod = candidateClass.getDeclaredMethod(methodName, paramTypes);
+        } catch (final NoSuchMethodException ignored) {
+            // No exact match; check for generic-bridge scenario: the declaring
+            // class may use a type variable whose erased form is Object (or
+            // another bound). In that case the parent method's erased
+            // parameter types differ from the child's concrete types, so we
+            // scan declared methods for a same-name method whose *erased*
+            // parameter count matches and whose erased types are assignable
+            // from our concrete types.
+            for (final Method candidate : candidateClass.getDeclaredMethods()) {
+                if (candidate.isBridge() || !candidate.getName().equals(methodName)) {
+                    continue;
+                }
+                final Class<?>[] candidateParams = candidate.getParameterTypes();
+                if (candidateParams.length != paramTypes.length) {
+                    continue;
+                }
+                // Require that every concrete param type is assignable to the
+                // candidate's (erased) param type AND that the candidate is
+                // generic (has at least one TypeVariable in its generic
+                // parameter types). This prevents matching plain overloads.
+                boolean genericMatch = false;
+                boolean paramsMatch = true;
+                final java.lang.reflect.Type[] genericParams = candidate.getGenericParameterTypes();
+                for (int i = 0; i < candidateParams.length; i++) {
+                    if (genericParams[i] instanceof java.lang.reflect.TypeVariable) {
+                        genericMatch = true;
+                    }
+                    if (!ClassUtils.isAssignable(paramTypes[i], candidateParams[i], true)) {
+                        paramsMatch = false;
+                        break;
+                    }
+                }
+                if (paramsMatch && genericMatch) {
+                    equivalentMethod = candidate;
+                    break;
+                }
+            }
+        }
+        // Never report a compiler-generated bridge; use the non-bridge method in the same class when available.
+        if (equivalentMethod != null && equivalentMethod.isBridge()) {
+            equivalentMethod = unbridge(equivalentMethod);
+        }
+        return equivalentMethod;
+    }
+
+    /**
+     * Resolves a compiler-generated bridge method to the user method it delegates to within the same declaring class.
+     *
+     * @param bridge the potential bridge method.
+     * @return the non-bridge method with the same name and parameter types declared by the same class, or the original method if none exists.
+     */
+    private static Method unbridge(final Method bridge) {
+        if (!bridge.isBridge()) {
+            return bridge;
+        }
+        for (final Method declared : bridge.getDeclaringClass().getDeclaredMethods()) {
+            if (!declared.isBridge() && declared.getName().equals(bridge.getName())
+                    && Arrays.equals(declared.getParameterTypes(), bridge.getParameterTypes())) {
+                return declared;
+            }
+        }
+        return bridge;
+    }
+
+    /**
+     * Gets every visible source of the given annotation on the given method as a source view.
+     *
+     * <p>
+     * Unlike {@link #getAnnotation(Method, Class, boolean, boolean)}, this method does not stop at the first hit and never silently chooses one candidate:
+     * </p>
+     * <ul>
+     * <li>The override graph is walked along <em>true override relationships</em> (matching name and parameter signature), not merely methods with the same
+     * name. An unrelated overload in a supertype is never reported as a source.</li>
+     * <li>Compiler-generated {@link Method#isBridge() bridge} methods are skipped, so a generic override is reported once instead of once per bridge.</li>
+     * <li>When an interface diamond places the annotation on several independently inherited members, every candidate is returned in subclass-to-supertype
+     * order instead of an arbitrary single value.</li>
+     * </ul>
+     *
+     * <p>
+     * Each returned {@link AnnotationSource} exposes the annotation, its declaring element and the full inheritance path walked to reach it.
+     * </p>
+     *
+     * @param <A> the annotation type.
+     * @param method the method to query, must not be {@code null}.
+     * @param annotationCls the annotation type to look up, must not be {@code null}.
+     * @param options search options; {@code null} uses {@link AnnotationSearchOptions#DIRECT}.
+     * @return the annotation sources in subclass-to-supertype order; an empty list when the annotation is absent.
+     * @throws NullPointerException Thrown if the method or annotation class is {@code null}.
+     * @since 3.21.0
+     */
+    public static <A extends Annotation> List<AnnotationSource<A>> getAnnotationSources(final Method method,
+            final Class<A> annotationCls, final AnnotationSearchOptions options) {
+        Objects.requireNonNull(method, "method");
+        Objects.requireNonNull(annotationCls, "annotationCls");
+        final AnnotationSearchOptions effective = options == null ? AnnotationSearchOptions.DIRECT : options;
+        final Method root = unbridge(method);
+        // Breadth-first walk of the override graph on (member, path-to-member) states. Each override edge is followed at
+        // most once, so a member reached through several branches (interface diamond) is reported once while still
+        // fanning out to its own overrides; members reached through distinct branches of a diamond are all returned in
+        // subclass-to-supertype order. Pass-through interfaces that merely inherit the method do not add a path element;
+        // only re-declaring members do.
+        final Set<Method> reported = new LinkedHashSet<>();
+        final Set<ImmutablePair<Method, Method>> followedEdges = new LinkedHashSet<>();
+        final Deque<List<Method>> queue = new ArrayDeque<>();
+        queue.addLast(new ArrayList<>(Collections.singletonList(root)));
+        final List<AnnotationSource<A>> result = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            final List<Method> currentPath = queue.removeFirst();
+            final Method current = currentPath.get(currentPath.size() - 1);
+            if (reported.add(current)
+                    && (effective.isIgnoreAccess() || MemberUtils.isAccessible(current))) {
+                final A annotation = current.getDeclaredAnnotation(annotationCls);
+                if (annotation != null) {
+                    result.add(new AnnotationSource<>(annotation, current, currentPath));
+                }
+            }
+            if (!effective.isSearchSupers()) {
+                continue;
+            }
+            for (final Method next : findOverriddenMembers(current)) {
+                // De-duplicate on the override edge (member pair), not the target member, so a diamond that merges into
+                // one member keeps that member's outgoing edges alive on every branch.
+                final ImmutablePair<Method, Method> edge = ImmutablePair.of(current, next);
+                if (!followedEdges.add(edge)) {
+                    continue;
+                }
+                final List<Method> nextPath = new ArrayList<>(currentPath.size() + 1);
+                nextPath.addAll(currentPath);
+                nextPath.add(next);
+                queue.addLast(nextPath);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Gets every visible source of the given annotation on the given class or interface as a source view.
+     *
+     * <p>
+     * Superclasses are followed before directly implemented interfaces, which are followed before their own super-interfaces; this is the same ordering
+     * used by {@link #getAnnotation(Method, Class, boolean, boolean)}. An interface diamond is traversed breadth-first, so a member reached through several
+     * paths is reported once, while independently annotated members of the diamond are all returned in type-to-supertype order.
+     * </p>
+     *
+     * @param <A> the annotation type.
+     * @param type the class or interface to query, must not be {@code null}.
+     * @param annotationCls the annotation type to look up, must not be {@code null}.
+     * @param options search options; {@code null} uses {@link AnnotationSearchOptions#DIRECT}.
+     * @return the annotation sources in type-to-supertype order; an empty list when the annotation is absent.
+     * @throws NullPointerException Thrown if the type or annotation class is {@code null}.
+     * @since 3.21.0
+     */
+    public static <A extends Annotation> List<AnnotationSource<A>> getAnnotationSources(final Class<?> type,
+            final Class<A> annotationCls, final AnnotationSearchOptions options) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(annotationCls, "annotationCls");
+        final AnnotationSearchOptions effective = options == null ? AnnotationSearchOptions.DIRECT : options;
+        // Breadth-first walk of the type graph. The key set is also the visited set, so a diamond merge is de-duplicated.
+        final Map<Class<?>, List<Class<?>>> visited = new LinkedHashMap<>();
+        final Deque<Class<?>> queue = new ArrayDeque<>();
+        visited.put(type, Collections.singletonList(type));
+        queue.add(type);
+        final List<AnnotationSource<A>> result = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            final Class<?> current = queue.removeFirst();
+            final A annotation = current.getDeclaredAnnotation(annotationCls);
+            if (annotation != null) {
+                result.add(new AnnotationSource<>(annotation, current, visited.get(current)));
+            }
+            if (!effective.isSearchSupers()) {
+                continue;
+            }
+            final List<Class<?>> currentPath = visited.get(current);
+            for (final Class<?> nextType : supertypes(current)) {
+                if (nextType == null || visited.containsKey(nextType)) {
+                    continue;
+                }
+                final List<Class<?>> nextPath = new ArrayList<>(currentPath.size() + 1);
+                nextPath.addAll(currentPath);
+                nextPath.add(nextType);
+                visited.put(nextType, nextPath);
+                queue.addLast(nextType);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Gets the annotation when exactly one source is visible on the given method.
+     *
+     * @param <A> the annotation type.
+     * @param method the method to query, must not be {@code null}.
+     * @param annotationCls the annotation type to look up, must not be {@code null}.
+     * @param options search options; {@code null} uses {@link AnnotationSearchOptions#DIRECT}.
+     * @return an optional holding the unique annotation; empty when the annotation is absent or several candidates compete.
+     * @throws NullPointerException Thrown if the method or annotation class is {@code null}.
+     * @since 3.21.0
+     */
+    public static <A extends Annotation> Optional<A> getUniqueAnnotation(final Method method, final Class<A> annotationCls,
+            final AnnotationSearchOptions options) {
+        final List<AnnotationSource<A>> sources = getAnnotationSources(method, annotationCls, options);
+        return sources.size() == 1 ? Optional.of(sources.get(0).getAnnotation()) : Optional.empty();
+    }
+
+    /**
+     * Gets the annotation when exactly one source is visible on the given class or interface.
+     *
+     * @param <A> the annotation type.
+     * @param type the class or interface to query, must not be {@code null}.
+     * @param annotationCls the annotation type to look up, must not be {@code null}.
+     * @param options search options; {@code null} uses {@link AnnotationSearchOptions#DIRECT}.
+     * @return an optional holding the unique annotation; empty when the annotation is absent or several candidates compete.
+     * @throws NullPointerException Thrown if the type or annotation class is {@code null}.
+     * @since 3.21.0
+     */
+    public static <A extends Annotation> Optional<A> getUniqueAnnotation(final Class<?> type, final Class<A> annotationCls,
+            final AnnotationSearchOptions options) {
+        final List<AnnotationSource<A>> sources = getAnnotationSources(type, annotationCls, options);
+        return sources.size() == 1 ? Optional.of(sources.get(0).getAnnotation()) : Optional.empty();
+    }
+
+    /**
+     * Gets the direct supertypes of the given type in the order used by legacy searches: superclass first, then directly implemented interfaces.
+     *
+     * @param type the type to inspect.
+     * @return the non-null direct supertypes, never {@code null}.
+     */
+    private static List<Class<?>> supertypes(final Class<?> type) {
+        final List<Class<?>> result = new ArrayList<>();
+        if (type.getSuperclass() != null) {
+            result.add(type.getSuperclass());
+        }
+        Collections.addAll(result, type.getInterfaces());
+        return result;
+    }
+
+    /**
+     * Options controlling the annotation source view lookups
+     * {@link MethodUtils#getAnnotationSources(Method, Class, AnnotationSearchOptions)} and
+     * {@link MethodUtils#getAnnotationSources(Class, Class, AnnotationSearchOptions)}.
+     *
+     * <p>
+     * The defaults ({@link #DIRECT}) deliberately mirror
+     * {@code getAnnotation(element, annotationCls, false, false)}: only the queried element is inspected, so callers that do not opt in keep the
+     * established direct-only behavior.
+     * </p>
+     *
+     * @since 3.21.0
+     */
+    public static final class AnnotationSearchOptions {
+
+        /** Direct lookup on the queried element only; inaccessible members are skipped, matching the historical defaults. */
+        public static final AnnotationSearchOptions DIRECT = new AnnotationSearchOptions(false, false);
+
+        /** Walk the full superclass and interface graph. */
+        public static final AnnotationSearchOptions SUPERTYPES = new AnnotationSearchOptions(true, false);
+
+        /** Walk the full superclass and interface graph, including non-public members. */
+        public static final AnnotationSearchOptions SUPERTYPES_IGNORE_ACCESS = new AnnotationSearchOptions(true, true);
+
+        /**
+         * Creates options that search supertypes.
+         *
+         * @param ignoreAccess whether to include non-accessible members.
+         * @return a new options instance.
+         */
+        public static AnnotationSearchOptions searchSupers(final boolean ignoreAccess) {
+            return new AnnotationSearchOptions(true, ignoreAccess);
+        }
+
+        private final boolean searchSupers;
+
+        private final boolean ignoreAccess;
+
+        private AnnotationSearchOptions(final boolean searchSupers, final boolean ignoreAccess) {
+            this.searchSupers = searchSupers;
+            this.ignoreAccess = ignoreAccess;
+        }
+
+        /**
+         * Tests whether the lookup walks superclasses and interfaces.
+         *
+         * @return {@code true} if supertypes are searched.
+         */
+        public boolean isSearchSupers() {
+            return searchSupers;
+        }
+
+        /**
+         * Tests whether non-accessible members are included.
+         *
+         * @return {@code true} if access checks are suppressed.
+         */
+        public boolean isIgnoreAccess() {
+            return ignoreAccess;
+        }
     }
 
     private static Method getInvokeMethod(final boolean forceAccess, final String methodName, final Class<?>[] parameterTypes, final Class<?> cls) {
