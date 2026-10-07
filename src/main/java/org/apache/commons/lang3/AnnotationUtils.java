@@ -18,7 +18,18 @@ package org.apache.commons.lang3;
 
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.commons.lang3.builder.AbstractReflection;
 import org.apache.commons.lang3.builder.ToStringBuilder;
@@ -50,6 +61,91 @@ import org.apache.commons.lang3.exception.UncheckedException;
  * @since 3.0
  */
 public class AnnotationUtils {
+
+    /**
+     * A single candidate source of an annotation looked up along the method
+     * override relationship.
+     *
+     * <p>
+     * Each instance represents one method in the override closure of the
+     * queried method on which the requested annotation is declared, together
+     * with the inheritance path that leads from the queried method to that
+     * declaring method. When several interfaces declare the same annotated
+     * method (a "diamond"), every conflicting candidate is reported as its own
+     * {@code AnnotationSource}; no arbitrary choice is made.
+     * </p>
+     *
+     * @since 3.21.1
+     */
+    public static final class AnnotationSource {
+
+        /** Path from the queried method (first) to the declaring method (last). */
+        private final List<Method> path;
+
+        /** The annotation as declared on the source method. */
+        private final Annotation annotation;
+
+        private AnnotationSource(final List<Method> path, final Annotation annotation) {
+            this.path = Collections.unmodifiableList(new ArrayList<>(path));
+            this.annotation = annotation;
+        }
+
+        /**
+         * Gets the annotation found at the source of the path.
+         *
+         * @return the annotation, never {@code null}
+         */
+        public Annotation getAnnotation() {
+            return annotation;
+        }
+
+        /**
+         * Gets the queried method, i.e. the first element of the path.
+         *
+         * @return the queried method
+         */
+        public Method getMethod() {
+            return path.get(0);
+        }
+
+        /**
+         * Gets the inheritance path from the queried method to the declaring
+         * method, following the override relationship. The first element is
+         * the queried method, the last element is the method on which the
+         * annotation is declared. Bridge methods never appear in the path.
+         *
+         * @return the unmodifiable path, never {@code null} or empty
+         */
+        public List<Method> getPath() {
+            return path;
+        }
+
+        /**
+         * Gets the method on which the annotation is declared, i.e. the last
+         * element of the path.
+         *
+         * @return the declaring method
+         */
+        public Method getSource() {
+            return path.get(path.size() - 1);
+        }
+
+        /**
+         * {@inheritDoc}
+         */
+        @Override
+        public String toString() {
+            final StringBuilder builder = new StringBuilder();
+            builder.append(AnnotationUtils.toString(annotation)).append(" at ");
+            for (int i = 0; i < path.size(); i++) {
+                if (i > 0) {
+                    builder.append(" -> ");
+                }
+                builder.append(AnnotationUtils.toString(path.get(i)));
+            }
+            return builder.toString();
+        }
+    }
 
     /**
      * A style that prints annotations as recommended.
@@ -234,6 +330,75 @@ public class AnnotationUtils {
     }
 
     /**
+     * Finds every candidate source of the given annotation for the given
+     * method by following the method <em>override relationship</em> rather
+     * than a plain same-name search.
+     *
+     * <p>
+     * Starting at {@code method}, the lookup walks to the methods it
+     * overrides or implements in superclasses and superinterfaces, and so on
+     * transitively. A super method is only considered when name and
+     * (erased) signature make it a genuine override or implementation
+     * target; methods that merely share a name but declare different
+     * parameters are ignored. Compiler-generated bridge methods are used to
+     * recognize generic overrides but never appear as candidates or path
+     * elements, so generic signatures produce no duplicate results.
+     * </p>
+     *
+     * <p>
+     * Every method in this override closure on which
+     * {@code annotationType} is declared produces one
+     * {@link AnnotationSource} holding the annotation and the inheritance
+     * path leading to it. When a class implements two interfaces that both
+     * declare the same annotated method (an interface "diamond"), all
+     * conflicting candidates are returned instead of an arbitrary single
+     * choice. When no method in the closure carries the annotation, an
+     * empty list is returned.
+     * </p>
+     *
+     * <p>
+     * This method is an opt-in, additive view; it does not change the
+     * behavior of any other method of this class, and callers that do not
+     * use it observe no difference.
+     * </p>
+     *
+     * @param method the method whose annotation sources are desired, not {@code null}
+     * @param annotationType the annotation type to look for, not {@code null}
+     * @return an unmodifiable list of candidate sources, in breadth-first
+     * order from the queried method, never {@code null}
+     * @since 3.21.1
+     */
+    public static List<AnnotationSource> getAnnotationSources(final Method method,
+            final Class<? extends Annotation> annotationType) {
+        Validate.notNull(method, "method");
+        Validate.notNull(annotationType, "annotationType");
+        final Method start = resolveBridge(method);
+        final Map<Method, AnnotationSource> sources = new LinkedHashMap<>();
+        final Map<Method, List<Method>> paths = new HashMap<>();
+        final Set<Method> visited = new HashSet<>();
+        final Deque<Method> queue = new ArrayDeque<>();
+        visited.add(start);
+        paths.put(start, Collections.singletonList(start));
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            final Method current = queue.poll();
+            final Annotation annotation = current.getDeclaredAnnotation(annotationType);
+            if (annotation != null && !sources.containsKey(current)) {
+                sources.put(current, new AnnotationSource(paths.get(current), annotation));
+            }
+            for (final Method superMethod : getSuperMethods(current)) {
+                if (visited.add(superMethod)) {
+                    final List<Method> path = new ArrayList<>(paths.get(current));
+                    path.add(superMethod);
+                    paths.put(superMethod, path);
+                    queue.add(superMethod);
+                }
+            }
+        }
+        return Collections.unmodifiableList(new ArrayList<>(sources.values()));
+    }
+
+    /**
      * Generate a hash code for the given annotation using the algorithm
      * presented in the {@link Annotation#hashCode()} API docs.
      *
@@ -302,6 +467,175 @@ public class AnnotationUtils {
         }
         return type.isPrimitive() || type.isEnum() || type.isAnnotation()
                 || String.class.equals(type) || Class.class.equals(type);
+    }
+
+    /**
+     * Adds the method declared by {@code type} that {@code method} overrides
+     * or implements, if any, to {@code result}. When both a bridge method and
+     * its non-bridge counterpart match, the non-bridge method wins so that
+     * bridge duplicates are never reported.
+     *
+     * @param type the super type to inspect
+     * @param method the overriding/implementing method
+     * @param result collects the matching super method
+     * @return whether a matching method was declared by {@code type}
+     */
+    private static boolean addSuperMethod(final Class<?> type, final Method method, final List<Method> result) {
+        Method match = null;
+        for (final Method candidate : type.getDeclaredMethods()) {
+            if (isOverridePair(candidate, method)
+                    && (match == null || match.isBridge() && !candidate.isBridge())) {
+                match = candidate;
+            }
+        }
+        if (match == null) {
+            return false;
+        }
+        result.add(match);
+        return true;
+    }
+
+    /**
+     * Collects the interface methods that {@code method} implements. When an
+     * interface does not redeclare the method, its own superinterfaces are
+     * searched transitively, so every branch of an interface diamond that
+     * declares the method contributes a candidate.
+     *
+     * @param iface the interface to inspect
+     * @param method the implementing method
+     * @param result collects the matching interface methods
+     * @param visited guards against revisiting interfaces in a diamond
+     */
+    private static void collectInterfaceMethods(final Class<?> iface, final Method method, final List<Method> result,
+            final Set<Class<?>> visited) {
+        if (!visited.add(iface)) {
+            return;
+        }
+        if (!addSuperMethod(iface, method, result)) {
+            for (final Class<?> parent : iface.getInterfaces()) {
+                collectInterfaceMethods(parent, method, result, visited);
+            }
+        }
+    }
+
+    /**
+     * Gets the methods that {@code method} directly overrides or implements:
+     * the matching method declared by the superclass, if any, and the
+     * matching methods declared by (possibly transitive) superinterfaces.
+     *
+     * @param method the method to inspect
+     * @return the directly overridden/implemented methods, never {@code null}
+     */
+    private static List<Method> getSuperMethods(final Method method) {
+        final int modifiers = method.getModifiers();
+        if (Modifier.isPrivate(modifiers) || Modifier.isStatic(modifiers)) {
+            return Collections.emptyList();
+        }
+        final List<Method> result = new ArrayList<>();
+        final Class<?> declaringClass = method.getDeclaringClass();
+        final Class<?> superclass = declaringClass.getSuperclass();
+        if (superclass != null) {
+            addSuperMethod(superclass, method, result);
+        }
+        for (final Class<?> iface : declaringClass.getInterfaces()) {
+            collectInterfaceMethods(iface, method, result, new HashSet<>());
+        }
+        return result;
+    }
+
+    /**
+     * Tests whether {@code subMethod} overrides or implements
+     * {@code superMethod}. Besides exact signature matches, a generic
+     * override is recognized through the compiler-generated bridge method
+     * that links the erased super signature to the concrete sub signature.
+     *
+     * @param superMethod the candidate overridden/implemented method
+     * @param subMethod the candidate overriding/implementing method
+     * @return whether the pair forms an override relationship
+     */
+    private static boolean isOverridePair(final Method superMethod, final Method subMethod) {
+        if (!superMethod.getName().equals(subMethod.getName())
+                || superMethod.getParameterCount() != subMethod.getParameterCount()) {
+            return false;
+        }
+        final int modifiers = superMethod.getModifiers();
+        if (Modifier.isPrivate(modifiers) || Modifier.isStatic(modifiers)) {
+            return false;
+        }
+        if (Arrays.equals(superMethod.getParameterTypes(), subMethod.getParameterTypes())) {
+            return true;
+        }
+        for (final Method bridge : subMethod.getDeclaringClass().getDeclaredMethods()) {
+            if (bridge.isBridge() && bridge.getName().equals(subMethod.getName())
+                    && Arrays.equals(bridge.getParameterTypes(), superMethod.getParameterTypes())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolves a compiler-generated bridge method to its non-bridge
+     * counterpart declared by the same class, so that looking up sources for
+     * a bridge method does not produce a duplicate view of the same logical
+     * method. Non-bridge methods are returned unchanged.
+     *
+     * @param method the method to resolve
+     * @return the non-bridge counterpart, or {@code method} itself
+     */
+    private static Method resolveBridge(final Method method) {
+        if (!method.isBridge()) {
+            return method;
+        }
+        for (final Method candidate : method.getDeclaringClass().getDeclaredMethods()) {
+            if (!candidate.isBridge() && candidate.getName().equals(method.getName())
+                    && candidate.getParameterCount() == method.getParameterCount()
+                    && isAssignable(candidate.getParameterTypes(), method.getParameterTypes())
+                    && method.getReturnType().isAssignableFrom(candidate.getReturnType())) {
+                return candidate;
+            }
+        }
+        return method;
+    }
+
+    /**
+     * Tests whether each element of {@code to} is assignable from the
+     * corresponding element of {@code from}.
+     *
+     * @param from the source types
+     * @param to the target types
+     * @return whether all pairs are assignable
+     */
+    private static boolean isAssignable(final Class<?>[] from, final Class<?>[] to) {
+        if (from.length != to.length) {
+            return false;
+        }
+        for (int i = 0; i < from.length; i++) {
+            if (!to[i].isAssignableFrom(from[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Generates a compact string representation of a method for
+     * {@link AnnotationSource#toString()}.
+     *
+     * @param method the method to render
+     * @return the string representation
+     */
+    private static String toString(final Method method) {
+        final StringBuilder builder = new StringBuilder();
+        builder.append(method.getDeclaringClass().getName()).append('.').append(method.getName()).append('(');
+        final Class<?>[] parameterTypes = method.getParameterTypes();
+        for (int i = 0; i < parameterTypes.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            builder.append(parameterTypes[i].getSimpleName());
+        }
+        return builder.append(')').toString();
     }
 
     /**
